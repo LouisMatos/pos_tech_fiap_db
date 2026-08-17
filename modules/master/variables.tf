@@ -1,6 +1,10 @@
 variable "table_name" {
 }
 
+variable "billing_mode" {
+  default = "PAY_PER_REQUEST"
+}
+
 variable "read_capacity" {
 }
 

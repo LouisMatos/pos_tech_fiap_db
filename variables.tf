@@ -9,6 +9,12 @@ variable "table_name" {
   default     = "Customers"
 }
 
+variable "billing_mode" {
+  description = "PAY_PER_REQUEST (recomendado p/ trafego baixo/variavel, sem custo fixo) ou PROVISIONED"
+  type        = string
+  default     = "PAY_PER_REQUEST"
+}
+
 variable "read_capacity" {
   description = "The read capacity for the DynamoDB table"
   type        = number
@@ -24,7 +30,7 @@ variable "write_capacity" {
 variable "hash_key" {
   description = "The attribute to use as the hash (partition) key"
   type        = string
-  default = "cpf"
+  default     = "cpf"
 }
 
 variable "tags" {

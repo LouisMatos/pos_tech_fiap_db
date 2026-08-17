@@ -1,0 +1,248 @@
+name: Terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Verificacao diaria de drift entre o state e a infra real (hom e prod)
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+
+  # DynamoDB e totalmente suportado pelo LocalStack Community - repo inteiro
+  # e testavel aqui, gratis, sem credencial AWS real.
+  validate-localstack:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:latest
+        ports: ["4566:4566"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init
+      - run: terraform apply -var-file=envs/dev-local.tfvars -var="localstack_enabled=true" -auto-approve
+      - run: terraform destroy -var-file=envs/dev-local.tfvars -var="localstack_enabled=true" -auto-approve
+
+  tfsec:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: false
+
+  # Roda so no PR (antes do merge) para o revisor ver o diff de infra.
+  # Somente plan - nenhuma credencial de apply e usada aqui.
+  plan-hom-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: hom
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
+      - run: terraform init -backend-config=envs/hom-backend.hcl
+      - run: terraform workspace select -or-create hom
+      - run: terraform validate
+      - name: Terraform Plan
+        run: terraform plan -no-color -var-file=envs/hom.tfvars | tee plan-hom.txt
+      - name: Post plan as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- terraform-plan-comment: hom -->';
+            let plan = fs.readFileSync('plan-hom.txt', 'utf8');
+            if (plan.length > 60000) {
+              plan = plan.substring(0, 60000) + '\n... (truncado)';
+            }
+            const body = `${marker}\n### Terraform Plan - hom\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  plan-prod-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
+      - run: terraform init -backend-config=envs/prod-backend.hcl
+      - run: terraform workspace select -or-create prod
+      - run: terraform validate
+      - name: Terraform Plan
+        run: terraform plan -no-color -var-file=envs/prod.tfvars | tee plan-prod.txt
+      - name: Post plan as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- terraform-plan-comment: prod -->';
+            let plan = fs.readFileSync('plan-prod.txt', 'utf8');
+            if (plan.length > 60000) {
+              plan = plan.substring(0, 60000) + '\n... (truncado)';
+            }
+            const body = `${marker}\n### Terraform Plan - prod\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  plan-hom:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: hom
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
+      - run: terraform init -backend-config=envs/hom-backend.hcl
+      - run: terraform workspace select -or-create hom
+      - run: terraform validate
+      - run: terraform plan -var-file=envs/hom.tfvars
+
+  apply-hom:
+    needs: plan-hom
+    runs-on: ubuntu-latest
+    environment: hom-apply   # GitHub Environment com reviewer obrigatorio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
+      - run: terraform init -backend-config=envs/hom-backend.hcl
+      - run: terraform workspace select -or-create hom
+      - run: terraform apply -var-file=envs/hom.tfvars -auto-approve
+
+  plan-prod:
+    needs: apply-hom
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
+      - run: terraform init -backend-config=envs/prod-backend.hcl
+      - run: terraform workspace select -or-create prod
+      - run: terraform validate
+      - run: terraform plan -var-file=envs/prod.tfvars
+
+  apply-prod:
+    needs: plan-prod
+    runs-on: ubuntu-latest
+    environment: prod-apply   # GitHub Environment com reviewer obrigatorio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
+      - run: terraform init -backend-config=envs/prod-backend.hcl
+      - run: terraform workspace select -or-create prod
+      - run: terraform apply -var-file=envs/prod.tfvars -auto-approve
+
+  # Deteccao diaria de drift. Nao aplica nada - so falha ruidosamente se o
+  # state divergir da infra real, como sinal para investigacao manual.
+  drift-detection:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [hom, prod]
+    environment: ${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
+      - run: terraform init -backend-config=envs/${{ matrix.environment }}-backend.hcl
+      - run: terraform workspace select -or-create ${{ matrix.environment }}
+      - name: Terraform plan (detect drift)
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -var-file=envs/${{ matrix.environment }}.tfvars
+          echo "exitcode=$?" >> "$GITHUB_OUTPUT"
+      - name: Report drift
+        if: steps.plan.outputs.exitcode == '2'
+        run: |
+          echo "::error::Drift detectado no ambiente ${{ matrix.environment }} - o state do Terraform diverge da infra real. Revise o plan acima e reconcilie manualmente."
+          exit 1
+      - name: Fail on plan error
+        if: steps.plan.outputs.exitcode != '0' && steps.plan.outputs.exitcode != '2'
+        run: |
+          echo "::error::terraform plan falhou (exit code ${{ steps.plan.outputs.exitcode }}) no ambiente ${{ matrix.environment }}."
+          exit 1

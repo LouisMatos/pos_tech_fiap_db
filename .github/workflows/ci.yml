@@ -1,23 +1,34 @@
-name: Terraform
+name: CI
 
 on:
   pull_request:
+    branches: [develop, "release/**", master]
   push:
-    branches: [main]
+    branches: ["feature/**", develop, "release/**", master]
   workflow_dispatch:
   schedule:
     # Verificacao diaria de drift entre o state e a infra real (hom e prod)
     - cron: '0 6 * * *'
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
   pull-requests: write
 
 jobs:
 
+  fmt-check:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+
   # DynamoDB e totalmente suportado pelo LocalStack Community - repo inteiro
-  # e testavel aqui, gratis, sem credencial AWS real.
+  # e testavel aqui, gratis, sem credencial AWS real. Serve de gate "dev" pra
+  # esse repo: apply real contra AWS em dev e acao local do desenvolvedor
+  # (ver README/CLAUDE.md), nao passa pela esteira.
   validate-localstack:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -33,7 +44,7 @@ jobs:
       - run: terraform destroy -var-file=envs/dev-local.tfvars -var="localstack_enabled=true" -auto-approve
 
   tfsec:
-    if: github.event_name == 'pull_request'
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -144,41 +155,84 @@ jobs:
               });
             }
 
-  plan-hom:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  # PR automatico feature/* -> develop, apos os gates (fmt/validate/tfsec) passarem.
+  open-pr-to-develop:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feature/')
+    needs: [fmt-check, validate-localstack, tfsec]
     runs-on: ubuntu-latest
-    environment: hom
     steps:
       - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
-          aws-region: ${{ secrets.AWS_REGION }}
-      - run: terraform init -backend-config=envs/hom-backend.hcl
-      - run: terraform workspace select -or-create hom
-      - run: terraform validate
-      - run: terraform plan -var-file=envs/hom.tfvars
+      - name: Abre PR feature -> develop (idempotente)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base develop --state open --json number --jq '.[0].number')
+          if [ -z "$existing" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base develop --head "$BRANCH" \
+              --title "infra: ${BRANCH#feature/}" \
+              --body "PR automatico apos pipeline 1 (fmt-check + validate-localstack + tfsec) passar."
+          else
+            echo "PR #$existing ja aberto $BRANCH -> develop, nada a fazer"
+          fi
 
-  apply-hom:
-    needs: plan-hom
+  # Merge em develop: resolve/cria release/N ativa e abre PR develop -> release/N.
+  open-pr-to-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: [fmt-check, validate-localstack, tfsec]
     runs-on: ubuntu-latest
-    environment: hom-apply   # GitHub Environment com reviewer obrigatorio
     steps:
       - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
-          aws-region: ${{ secrets.AWS_REGION }}
-      - run: terraform init -backend-config=envs/hom-backend.hcl
-      - run: terraform workspace select -or-create hom
-      - run: terraform apply -var-file=envs/hom.tfvars -auto-approve
+          fetch-depth: 0
+      - name: Resolve release ativa ou cria nova, abre PR develop -> release/N
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin 'refs/heads/release/*:refs/remotes/origin/release/*' --prune
 
-  plan-prod:
-    needs: apply-hom
+          max_n=0
+          active_n=""
+          for ref in $(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/release/*'); do
+            n="${ref##*/release/}"
+            case "$n" in ''|*[!0-9]*) continue ;; esac
+            [ "$n" -gt "$max_n" ] && max_n=$n
+            if ! git merge-base --is-ancestor "origin/release/$n" origin/master; then
+              if [ -n "$active_n" ]; then
+                echo "::warning::mais de uma release ativa encontrada (release/$active_n e release/$n) - investigar manualmente"
+              fi
+              active_n=$n
+            fi
+          done
+
+          if [ -n "$active_n" ]; then
+            target="release/$active_n"
+            echo "Reutilizando release ativa: $target"
+          else
+            target="release/$((max_n + 1))"
+            git checkout -b "$target" origin/master
+            git push origin "$target"
+            echo "Nova release criada: $target"
+          fi
+
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --head develop --base "$target" --state open --json number --jq '.[0].number')
+          if [ -z "$existing" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base "$target" --head develop \
+              --title "release: develop -> $target" \
+              --body "PR automatico: consolida develop na release ativa."
+          else
+            echo "PR #$existing ja aberto develop -> $target, nada a fazer"
+          fi
+
+  # Valida "pacote" antes de abrir PR pra master: plan contra prod precisa
+  # terminar limpo (0) ou so com diff esperado (2); erro real (outro codigo) bloqueia.
+  validate-package:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')
+    needs: [fmt-check, validate-localstack, tfsec]
     runs-on: ubuntu-latest
     environment: prod
     steps:
@@ -192,23 +246,38 @@ jobs:
       - run: terraform init -backend-config=envs/prod-backend.hcl
       - run: terraform workspace select -or-create prod
       - run: terraform validate
-      - run: terraform plan -var-file=envs/prod.tfvars
+      - name: Plan contra prod (validacao de pacote)
+        run: |
+          set +e
+          terraform plan -var-file=envs/prod.tfvars -detailed-exitcode
+          code=$?
+          set -e
+          if [ "$code" != "0" ] && [ "$code" != "2" ]; then
+            echo "::error::terraform plan falhou (codigo $code) validando pacote pra prod."
+            exit 1
+          fi
 
-  apply-prod:
-    needs: plan-prod
+  # Merge em release/N com pacote validado: abre PR release/N -> master.
+  open-pr-to-master:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')
+    needs: validate-package
     runs-on: ubuntu-latest
-    environment: prod-apply   # GitHub Environment com reviewer obrigatorio
     steps:
       - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
-          aws-region: ${{ secrets.AWS_REGION }}
-      - run: terraform init -backend-config=envs/prod-backend.hcl
-      - run: terraform workspace select -or-create prod
-      - run: terraform apply -var-file=envs/prod.tfvars -auto-approve
+      - name: Abre PR release/N -> master (idempotente)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base master --state open --json number --jq '.[0].number')
+          if [ -z "$existing" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$BRANCH" \
+              --title "release: $BRANCH -> master" \
+              --body "Pacote validado: terraform plan contra prod ok. Apply manual disponivel via apply.yml apos o merge."
+          else
+            echo "PR #$existing ja aberto $BRANCH -> master, nada a fazer"
+          fi
 
   # Deteccao diaria de drift. Nao aplica nada - so falha ruidosamente se o
   # state divergir da infra real, como sinal para investigacao manual.

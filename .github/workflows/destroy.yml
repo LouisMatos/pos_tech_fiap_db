@@ -1,43 +1,58 @@
-name: Manually triggered workflow
+name: Terraform Destroy
 
 on:
   workflow_dispatch:
     inputs:
-      env:
-        description: 'Destroy environment'
+      environment:
+        description: 'Target environment'
         required: true
-        default: 'Destroy'
+        type: choice
+        options:
+          - hom
+          - prod
+      confirm:
+        description: 'Type the environment name again to confirm destruction (e.g. "prod")'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   destroy:
-    name: "Destroy AWS"
+    name: "Destroy ${{ inputs.environment }}"
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}-apply   # GitHub Environment com reviewer obrigatorio
     steps:
-        - name: Checkout
-          uses: actions/checkout@v2
+      - name: Validate confirmation input
+        run: |
+          if [ "${{ inputs.confirm }}" != "${{ inputs.environment }}" ]; then
+            echo "Confirmation text '${{ inputs.confirm }}' does not match environment '${{ inputs.environment }}'. Aborting."
+            exit 1
+          fi
 
-        - name: Configure AWS credentials
-          uses: aws-actions/configure-aws-credentials@v1
-          with:
-              aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-              aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-              aws-region: ${{ secrets.AWS_REGION }}
+      - name: Checkout
+        uses: actions/checkout@v4
 
-        - name: Terraform Init
-          run: terraform init     
+      - uses: hashicorp/setup-terraform@v3
 
-        - name: AWS Plan Copy
-          run: aws s3 cp s3://terraformestado/db_terraform/terraform.tfstate terraform.tfstate
-          id: copy
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-pos_tech_fiap_db
+          aws-region: ${{ secrets.AWS_REGION }}
 
-        - name: Show Destroy plan
-          run: terraform plan -destroy
+      - name: Terraform Init
+        run: terraform init -backend-config=envs/${{ inputs.environment }}-backend.hcl
 
-        - name: Destroy resources jobs
-          id: destroy
-          run: terraform destroy -auto-approve
+      - name: Select workspace
+        run: terraform workspace select -or-create ${{ inputs.environment }}
 
-        - name: Delete plan file
-          if: steps.destroy.outcome == 'success'
-          run: aws s3 rm s3://terraformestado/db_terraform/terraform.tfstate
+      - name: Terraform validate
+        run: terraform validate
 
+      - name: Show destroy plan
+        run: terraform plan -destroy -var-file=envs/${{ inputs.environment }}.tfvars
+
+      - name: Destroy resources
+        run: terraform destroy -var-file=envs/${{ inputs.environment }}.tfvars -auto-approve

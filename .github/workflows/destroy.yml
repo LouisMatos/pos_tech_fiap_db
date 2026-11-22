@@ -22,7 +22,7 @@ jobs:
   destroy:
     name: "Destroy ${{ inputs.environment }}"
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}-apply   # GitHub Environment com reviewer obrigatorio
+    environment: ${{ inputs.environment }}   # GitHub Environment com reviewer obrigatorio
     steps:
       - name: Validate confirmation input
         run: |
